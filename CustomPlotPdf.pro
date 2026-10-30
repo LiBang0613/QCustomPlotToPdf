@@ -9,7 +9,7 @@
 #    4. 通过 QPdfWriter + QCPPainter，用 QCustomPlot::toPainter 矢量绘制到 PDF
 # ============================================================
 
-QT       += core gui printsupport widgets concurrent
+QT       += core gui printsupport widgets
 
 CONFIG   += c++11
 
@@ -21,16 +21,18 @@ SOURCES += \
     main.cpp \
     mainwindow.cpp \
     pdfexporter.cpp \
-    pdfmerge.cpp \
     plotfactory.cpp \
     qcustomplot.cpp
 
 HEADERS += \
     mainwindow.h \
     pdfexporter.h \
-    pdfmerge.h \
     plotfactory.h \
     qcustomplot.h
+
+# 多进程分片合并方案（当前单进程导出未使用）保留源码，需要时再追加：
+#   SOURCES += pdfmerge.cpp
+#   HEADERS += pdfmerge.h
 
 INCLUDEPATH += $$PWD
 

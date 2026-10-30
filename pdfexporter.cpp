@@ -1,34 +1,31 @@
 #include "pdfexporter.h"
 
-#include "pdfmerge.h"
 #include "qcustomplot.h"
 
-#include <QAtomicInt>
-#include <QDir>
 #include <QPageSize>
 #include <QPdfWriter>
-#include <QThread>
-#include <QtConcurrent/QtConcurrent>
+#include <QSaveFile>
 
 namespace PdfExporter {
 
 namespace {
 
-// 渲染一个分片（firstPage 起 pageCount 页）到独立 PDF 文件。
-// 该分片内复用单个 QCustomPlot；首片第一页不换页，其余页 newPage。
-// doneCells / totalCells 用于跨分片合并进度（原子计数）。
-bool renderPart(const QString &partFile,
+// 将 firstPage 起的 pageCount 页渲染到 PDF 设备。
+// 整个渲染过程复用单个 QCustomPlot；第一页不换页，其余页 newPage。
+// 注意：QCustomPlot 是 QWidget，只能在 GUI 线程创建和绘制，
+// 因此本函数必须由拥有 QApplication 的 GUI 线程调用。
+bool renderPart(QIODevice *device,
                 int firstPage,
                 int partPageCount,
                 int cols,
                 int rows,
                 const PlotConfigureFn &configurePlot,
                 int resolutionDpi,
-                std::atomic<int> *doneCells,
+                int *doneCells,
                 int totalCells,
                 const ProgressFn &onProgress)
 {
-    QPdfWriter writer(partFile);
+    QPdfWriter writer(device);
     writer.setResolution(resolutionDpi);
     writer.setPageSize(QPageSize(QSizeF(210.0, 297.0), QPageSize::Millimeter));
     writer.setTitle(QStringLiteral("QCustomPlot 多页导出"));
@@ -73,7 +70,7 @@ bool renderPart(const QString &partFile,
             plot.toPainter(&painter, cellWpx, cellHpx);
             painter.restore();
 
-            const int done = doneCells->fetch_add(1) + 1;
+            const int done = ++(*doneCells);
             if (onProgress)
                 onProgress(done, totalCells);
         }
@@ -102,78 +99,32 @@ bool exportPages(const QString &fileName,
         return false;
     }
 
-    // —— 分片数量：按 CPU 核数并行（上限 8 片），页数少时自动退化为 1 片 ——
-    const int parts = qBound(1, qMin(QThread::idealThreadCount(), 8), pageCount);
-    const int totalCells = pageCount * cols * rows;
-
-    if (parts == 1)
-    {
-        std::atomic<int> done(0);
-        return renderPart(fileName, 0, pageCount, cols, rows, configurePlot,
-                          resolutionDpi, &done, totalCells, onProgress);
-    }
-
-    // —— 建立临时目录与分片文件列表 ——
-    const QString tmpDir = QDir::tempPath() + QStringLiteral("/CustomPlotPdf_parts_%1")
-                           .arg(QCoreApplication::applicationPid());
-    QDir().mkpath(tmpDir);
-    QStringList partFiles;
-    for (int i = 0; i < parts; ++i)
-        partFiles.append(tmpDir + QStringLiteral("/part_%1.pdf").arg(i));
-
-    // —— 页数均分 ——
-    QVector<int> firstPages(parts), partCounts(parts);
-    int remain = pageCount;
-    for (int i = 0; i < parts; ++i)
-    {
-        partCounts[i] = remain / (parts - i);
-        remain -= partCounts[i];
-    }
-    int first = 0;
-    for (int i = 0; i < parts; ++i)
-    {
-        firstPages[i] = first;
-        first += partCounts[i];
-    }
-
-    // —— 并行渲染各分片（独立 QPdfWriter + 复用 plot，线程安全） ——
-    std::atomic<int> doneCells(0);
-    QVector<bool> partOk(parts, false);
-    {
-        QVector<int> idx(parts);
-        for (int i = 0; i < parts; ++i) idx[i] = i;
-
-        QtConcurrent::map(idx, [&](int i) {
-            partOk[i] = renderPart(partFiles.at(i), firstPages.at(i), partCounts.at(i),
-                                   cols, rows, configurePlot, resolutionDpi,
-                                   &doneCells, totalCells, onProgress);
-        }).waitForFinished();
-    }
-
-    bool allOk = true;
-    int failedPart = 0;
-    for (int i = 0; i < parts; ++i)
-        if (!partOk.at(i)) { allOk = false; failedPart = i; break; }
-    if (!allOk)
+    // QCustomPlot 基于 QWidget，QWidget 只能在 GUI 线程创建与绘制。
+    // 因此这里不做线程池/分片并行：始终在当前（GUI）线程顺序渲染。
+    // 通过 QSaveFile 写入：成功才原子替换目标文件，失败不会留下半个坏 PDF。
+    QSaveFile save(fileName);
+    if (!save.open(QIODevice::WriteOnly))
     {
         if (errorMessage)
-            *errorMessage = QStringLiteral("分片渲染失败（分片 %1/%2）").arg(failedPart + 1).arg(parts);
-        QDir(tmpDir).removeRecursively();
+            *errorMessage = QStringLiteral("无法写入文件：%1（%2）").arg(fileName, save.errorString());
         return false;
     }
 
-    // —— 合并分片为单个 PDF（引用重编号 + 内容流压缩 + 重建 Pages 树） ——
-    if (onProgress)
-        onProgress(totalCells, totalCells); // 渲染完成，进入合并阶段
-    QString mergeErr;
-    const bool merged = PdfMerger::mergeAndCompress(partFiles, fileName, &mergeErr, nullptr, 9);
-    if (qEnvironmentVariableIsEmpty("CUSTOM_PLOT_PDF_KEEP_PARTS"))
-        QDir(tmpDir).removeRecursively();
-
-    if (!merged)
+    const int totalCells = pageCount * cols * rows;
+    int done = 0;
+    const bool ok = renderPart(&save, 0, pageCount, cols, rows, configurePlot,
+                               resolutionDpi, &done, totalCells, onProgress);
+    if (!ok)
+    {
+        save.cancelWriting();
+        if (errorMessage)
+            *errorMessage = QStringLiteral("PDF 渲染失败：%1").arg(fileName);
+        return false;
+    }
+    if (!save.commit())
     {
         if (errorMessage)
-            *errorMessage = QStringLiteral("PDF 合并失败：%1").arg(mergeErr);
+            *errorMessage = QStringLiteral("无法保存文件：%1（%2）").arg(fileName, save.errorString());
         return false;
     }
     return true;

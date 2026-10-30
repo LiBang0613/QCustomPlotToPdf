@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDateTime>
+#include <QDebug>
 #include <QFile>
 #include <QTextStream>
 #include <QTimer>

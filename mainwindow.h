@@ -3,16 +3,7 @@
 
 #include <QMainWindow>
 #include <QString>
-#include <QFutureWatcher>
 #include <QElapsedTimer>
-
-// 一次异步导出的结果：是否成功 + 导出耗时（毫秒）+ 失败原因
-struct ExportResult
-{
-    bool ok;
-    qint64 elapsedMs;
-    QString error;
-};
 
 class QCustomPlot;
 class QProgressBar;
@@ -20,7 +11,8 @@ class QPushButton;
 class QSpinBox;
 
 // 主窗口：预览第 1 页的 4 个图（田字格），可选择导出页数 N 并导出 PDF。
-// 导出在 QtConcurrent 线程池中异步执行，不阻塞界面；完成后弹窗显示耗时。
+// 导出在 GUI 线程执行（QCustomPlot 是 QWidget，无法在后台线程绘制），
+// 期间通过 processEvents 保持界面刷新；完成后发 exportFinished 信号并弹窗显示耗时。
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -29,7 +21,7 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override = default;
 
-    // 对外入口：异步导出到 fileName（不阻塞界面），完成后发 exportFinished 信号。
+    // 对外入口：导出到 fileName，完成后发 exportFinished 信号。
     // pages 为导出页数 N。可用于自动化/自测场景。
     void exportToFile(const QString &fileName, int pages);
 
@@ -50,7 +42,7 @@ private slots:
     void onExportClicked();
 
 private:
-    void onExportFinished(QFutureWatcher<ExportResult> *watcher);
+    void finishExport(bool ok, qint64 elapsedMs, const QString &error);
     void updateProgressUi(int done, int total);
     void buildUi();
 

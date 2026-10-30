@@ -22,7 +22,14 @@ namespace PdfExporter
     //     QCustomPlot::toPainter(painter, cellWpx, cellHpx)，纯矢量输出
     //   - 页数 pageCount 即 N，默认由调用方指定（GUI 微调框 / 命令行 --pages），
     //     后续需要更多页只需改调用处，无需改动本函数。
+    //   - 输出通过 QSaveFile 写入：只有全部成功才原子替换目标文件，失败不留坏文件。
     // 返回 true 表示成功；失败时通过 errorMessage 返回原因（可为空指针）。
+    //
+    // 线程约束：QCustomPlot 是 QWidget，QWidget 只能在 GUI 线程创建和绘制。
+    // 本函数必须在拥有 QApplication 的 GUI 线程中调用（不能放进 QtConcurrent /
+    // QThread 工作线程，否则 Qt 会断言 "Widgets must be created in the GUI thread."）。
+    // 如果需要导出期间界面保持响应，请在 onProgress 回调里自行 processEvents。
+    //
     // resolutionDpi 必须保持 72（逻辑坐标与设备 1:1，Qt 5.15 PDF 引擎在该分辨率下
     // 才能正确输出 QCustomPlot 的 CJK 文本；矢量输出不依赖高分辨率）。
     bool exportPages(const QString &fileName,

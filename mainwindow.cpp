@@ -4,7 +4,9 @@
 #include "plotfactory.h"
 #include "qcustomplot.h"
 
+#include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -15,7 +17,12 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
-#include <QtConcurrent/QtConcurrent>
+
+namespace {
+// 每页田字格：2 列 x 2 行（网格布局与导出器必须保持一致）
+constexpr int kPlotCols = 2;
+constexpr int kPlotRows = 2;
+} // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -94,36 +101,43 @@ void MainWindow::exportToFile(const QString &fileName, int pages)
     m_lastProgressPct = -1;
     m_progressTimer.invalidate();
     m_btnExport->setEnabled(false);
-    m_progress->setRange(0, pages * 4); // 总格数：每页 4 个图
+    m_progress->setRange(0, pages * kPlotCols * kPlotRows); // 总格数：每页 4 个图
     m_progress->setValue(0);
     m_progress->setVisible(true);
     statusBar()->showMessage(QStringLiteral("正在导出 %1 页 PDF ... 0%").arg(pages));
 
-    // 异步导出：绘图与 PDF 渲染在 QtConcurrent 线程池线程执行，
-    // 主线程（GUI）继续处理事件，界面不会被卡住。
-    auto future = QtConcurrent::run([fileName, pages, this]() -> ExportResult {
-        QElapsedTimer timer;
-        timer.start();
-        QString err;
-        // 复用单 plot 渲染（updateSineCosPlot 首次调用自动完成初始化），
-        // 进度按格回调，经 QueuedConnection 回主线程节流更新进度条。
-        const bool ok = PdfExporter::exportPages(
-            fileName, pages, 2, 2,
-            [](QCustomPlot *p, int page, int cell) { updateSineCosPlot(p, page, cell); },
-            [this](int done, int total) {
-                QMetaObject::invokeMethod(
-                    this, [this, done, total]() { updateProgressUi(done, total); },
-                    Qt::QueuedConnection);
-            },
-            &err);
-        return ExportResult{ ok, timer.elapsed(), err };
-    });
+    // 导出期间暂停 4 个预览图的重绘，避免它们和离屏渲染抢 CPU；
+    // 进度条不属于这些控件，仍然正常刷新。
+    m_plot00->setUpdatesEnabled(false);
+    m_plot01->setUpdatesEnabled(false);
+    m_plot10->setUpdatesEnabled(false);
+    m_plot11->setUpdatesEnabled(false);
 
-    // 完成后回到主线程处理 UI（watcher 归属主线程，finished 信号在主线程发出）
-    auto *watcher = new QFutureWatcher<ExportResult>(this);
-    connect(watcher, &QFutureWatcher<ExportResult>::finished,
-            this, [this, watcher]() { onExportFinished(watcher); });
-    watcher->setFuture(future);
+    // QCustomPlot 是 QWidget，QWidget 只能在 GUI 线程创建和绘制，
+    // 因此导出必须在当前（GUI）线程执行，不能放进 QtConcurrent/QThread 工作线程
+    // （否则会触发 "Widgets must be created in the GUI thread." 断言/崩溃）。
+    // 为了让长导出期间界面仍能刷新，按时间片（约 30ms）processEvents，
+    // 而不是每格都处理事件，减少无效的事件循环开销。
+    QElapsedTimer timer;
+    QElapsedTimer pumpTimer;
+    timer.start();
+    pumpTimer.start();
+    QString err;
+    const bool ok = PdfExporter::exportPages(
+        fileName, pages, kPlotCols, kPlotRows,
+        [](QCustomPlot *p, int page, int cell) { updateSineCosPlot(p, page, cell); },
+        [this, &pumpTimer](int done, int total) {
+            updateProgressUi(done, total);
+            if (done >= total || pumpTimer.elapsed() >= 30)
+            {
+                // 只处理绘制/定时器等事件，排除鼠标键盘，避免导出期间重入点击。
+                QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+                pumpTimer.restart();
+            }
+        },
+        &err);
+
+    finishExport(ok, timer.elapsed(), err);
 }
 
 void MainWindow::updateProgressUi(int done, int total)
@@ -138,7 +152,7 @@ void MainWindow::updateProgressUi(int done, int total)
     if (!m_progressTimer.isValid())
         m_progressTimer.start();
 
-    m_progress->setRange(0, total);
+    // 范围在导出开始时按 pages*cols*rows 设好，这里只更新数值/文本。
     m_progress->setValue(done);
     m_progress->setFormat(QStringLiteral("导出中 %1%").arg(pct));
     statusBar()->showMessage(
@@ -150,28 +164,29 @@ int MainWindow::exportProgressValue() const
     return m_progress ? m_progress->value() : -1;
 }
 
-void MainWindow::onExportFinished(QFutureWatcher<ExportResult> *watcher)
+void MainWindow::finishExport(bool ok, qint64 elapsedMs, const QString &error)
 {
-    if (!watcher)
-        return;
-    const ExportResult result = watcher->result();
-    watcher->deleteLater();
-
     m_exporting = false;
     m_btnExport->setEnabled(true);
     m_progress->setValue(m_progress->maximum()); // 走满进度条
     m_progress->setVisible(false);
-    m_lastError = result.error;
+    m_lastError = error;
+
+    // 恢复预览图重绘
+    m_plot00->setUpdatesEnabled(true);
+    m_plot01->setUpdatesEnabled(true);
+    m_plot10->setUpdatesEnabled(true);
+    m_plot11->setUpdatesEnabled(true);
 
     QString timeStr;
-    if (result.elapsedMs >= 1000)
-        timeStr = QStringLiteral("%1 秒").arg(result.elapsedMs / 1000.0, 0, 'f', 2);
+    if (elapsedMs >= 1000)
+        timeStr = QStringLiteral("%1 秒").arg(elapsedMs / 1000.0, 0, 'f', 2);
     else
-        timeStr = QStringLiteral("%1 毫秒").arg(result.elapsedMs);
+        timeStr = QStringLiteral("%1 毫秒").arg(elapsedMs);
 
-    emit exportFinished(result.ok, result.elapsedMs);
+    emit exportFinished(ok, elapsedMs);
 
-    if (result.ok)
+    if (ok)
         statusBar()->showMessage(QStringLiteral("导出完成，耗时 %1").arg(timeStr), 10000);
     else
         statusBar()->showMessage(QStringLiteral("导出失败"), 10000);
@@ -179,7 +194,7 @@ void MainWindow::onExportFinished(QFutureWatcher<ExportResult> *watcher)
     if (!m_showDialogs)
         return;
 
-    if (result.ok)
+    if (ok)
         QMessageBox::information(
             this, QStringLiteral("导出完成"),
             QStringLiteral("已导出 %1 页 PDF：\n%2\n\n导出耗时：%3")
